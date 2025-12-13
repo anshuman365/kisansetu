@@ -2,7 +2,7 @@ import axios from 'axios';
 import { Order, User, UserRole, OrderStatus, Bid, Deal } from '../types';
 
 // Real Backend URL
-const API_URL = 'https://anshuman365.pythonanywhere.com';
+const API_URL = 'https://choice-logging-budapest-flavor.trycloudflare.com';
 
 // Axios Instance
 export const api = axios.create({
