@@ -10,14 +10,27 @@ export enum CropType {
   DHAN = 'Dhan (Paddy)',
   RICE = 'Rice',
   WHEAT = 'Wheat',
-  MAIZE = 'Maize'
+  MAIZE = 'Maize',
+  COTTON = 'Cotton',
+  SUGARCANE = 'Sugarcane',
+  PULSES = 'Pulses (Dal)',
+  MUSTARD = 'Mustard',
+  OTHER = 'Other'
 }
 
 export enum OrderStatus {
   OPEN = 'OPEN',
-  LOCKED = 'LOCKED',
+  LOCKED = 'LOCKED', // Offer accepted
+  TRANSIT = 'TRANSIT', // Using KisanSetu Transport
+  DIRECT_DEAL = 'DIRECT_DEAL', // Numbers exchanged
   DELIVERED = 'DELIVERED',
   CANCELLED = 'CANCELLED'
+}
+
+export interface Subscription {
+  plan: 'FREE' | 'PREMIUM' | 'ENTERPRISE';
+  expiryDate: string; // ISO Date
+  isActive: boolean;
 }
 
 export interface User {
@@ -27,19 +40,20 @@ export interface User {
   role: UserRole;
   location: string;
   isVerified: boolean;
+  kycStatus: 'PENDING' | 'APPROVED' | 'REJECTED' | 'NOT_SUBMITTED';
   trustScore: number;
+  subscription: Subscription;
 }
 
 export interface Order {
   id: string;
   farmerId: string;
   farmerName: string;
-  crop: CropType;
+  crop: string;
   variety: string;
-  quantity: number; // in quintals
-  quantityUnit: 'quintal' | 'ton';
+  quantity: number; 
+  quantityUnit: string;
   moisture: number;
-  brokenPercentage?: number;
   minPrice: number;
   currentHighBid?: number;
   location: string;
@@ -48,6 +62,7 @@ export interface Order {
   createdAt: string;
   expiresAt: string;
   bidsCount: number;
+  coordinates?: { lat: number; lng: number };
 }
 
 export interface Bid {
@@ -64,15 +79,26 @@ export interface Deal {
   orderId: string;
   buyerId: string;
   buyerName: string;
+  buyerPhone?: string; // Only visible if status is DIRECT_DEAL
   sellerId: string;
   sellerName: string;
+  sellerPhone?: string; // Only visible if status is DIRECT_DEAL
   crop: string;
   variety: string;
   finalPrice: number;
   quantity: number;
   quantityUnit: string;
   totalAmount: number;
-  status: 'LOCKED' | 'IN_TRANSIT' | 'DELIVERED' | 'CANCELLED';
+  status: OrderStatus;
+  transportMode?: 'KISAN_SETU' | 'SELF';
   createdAt: string;
-  deliveryDate?: string;
+}
+
+export interface Notification {
+  id: string;
+  userId: string;
+  message: string;
+  type: 'BID' | 'DEAL' | 'SYSTEM';
+  isRead: boolean;
+  timestamp: string;
 }

@@ -1,0 +1,669 @@
+
+from fastapi import FastAPI, Depends, HTTPException, status, Query, Body
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.orm import declarative_base, selectinload
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, ForeignKey, select
+from sqlalchemy.sql import func
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Dict, Any
+import enum
+import os
+import random
+from pydantic import BaseModel, Field, ConfigDict
+
+# ==========================================
+# CONFIGURATION & DATABASE
+# ==========================================
+# In production, change this to a secure random string
+SECRET_KEY = "kisan-setu-secure-secret-key-change-this"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 30 # 30 Days
+
+# Database URL (Defaults to SQLite for local dev)
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./kisansetu.db")
+
+engine = create_async_engine(DATABASE_URL, echo=False)
+Base = declarative_base()
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+# Dependency to get DB session
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+
+# Initialize DB (Create Tables)
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+# ==========================================
+# MODELS (SQLAlchemy)
+# ==========================================
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    phone = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    name = Column(String, nullable=False)
+    role = Column(String, nullable=False) # FARMER, BUYER, ADMIN
+    location = Column(String, nullable=False)
+    
+    # Verification & Trust
+    is_verified = Column(Boolean, default=False)
+    kyc_status = Column(String, default="NOT_SUBMITTED") # PENDING, APPROVED, REJECTED
+    kyc_doc_type = Column(String, nullable=True)
+    kyc_doc_number = Column(String, nullable=True)
+    trust_score = Column(Float, default=3.5)
+    
+    # Subscription
+    subscription_plan = Column(String, default="FREE") # FREE, PREMIUM, ENTERPRISE
+    subscription_expiry = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc) + timedelta(days=15))
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Computed Property for Pydantic V2 Compatibility
+    @property
+    def subscription(self):
+        return {
+            "plan": self.subscription_plan,
+            "expiry_date": self.subscription_expiry,
+            "is_active": self.subscription_expiry > datetime.now(timezone.utc)
+        }
+
+class Order(Base):
+    __tablename__ = "orders"
+    id = Column(Integer, primary_key=True, index=True)
+    farmer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    crop = Column(String, nullable=False)
+    variety = Column(String, nullable=False)
+    quantity = Column(Float, nullable=False)
+    quantity_unit = Column(String, nullable=False)
+    moisture = Column(Float, nullable=True)
+    min_price = Column(Float, nullable=False)
+    
+    # Location
+    location = Column(String, nullable=False)
+    pincode = Column(String, nullable=False)
+    lat = Column(Float, nullable=True)
+    lng = Column(Float, nullable=True)
+    
+    # Status
+    status = Column(String, default="OPEN") # OPEN, LOCKED, CLOSED
+    current_high_bid = Column(Float, default=0)
+    bids_count = Column(Integer, default=0)
+    
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    # Computed Property for Coordinates
+    @property
+    def coordinates(self):
+        if self.lat and self.lng:
+            return {"lat": self.lat, "lng": self.lng}
+        return None
+
+class Bid(Base):
+    __tablename__ = "bids"
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("orders.id"), nullable=False)
+    bidder_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    amount = Column(Float, nullable=False)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+
+class Deal(Base):
+    __tablename__ = "deals"
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("orders.id"), nullable=False)
+    seller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    buyer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    
+    # Deal Specifics
+    final_price = Column(Float, nullable=False)
+    total_amount = Column(Float, nullable=False)
+    
+    # Fulfillment
+    status = Column(String, default="LOCKED") # LOCKED, DIRECT_DEAL, TRANSIT, DELIVERED
+    transport_mode = Column(String, nullable=True) # KISAN_SETU, SELF
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class Notification(Base):
+    __tablename__ = "notifications"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    message = Column(String, nullable=False)
+    type = Column(String, default="SYSTEM") # BID, DEAL, SYSTEM
+    is_read = Column(Boolean, default=False)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+
+# ==========================================
+# PYDANTIC SCHEMAS (Response Models)
+# ==========================================
+
+class SubscriptionObj(BaseModel):
+    plan: str
+    expiry_date: datetime
+    is_active: bool
+
+class UserResponse(BaseModel):
+    id: int
+    name: str
+    phone: str
+    role: str
+    location: str
+    is_verified: bool
+    kyc_status: str
+    trust_score: float
+    subscription: SubscriptionObj
+    
+    model_config = ConfigDict(from_attributes=True)
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+class OrderResponse(BaseModel):
+    id: int
+    farmer_id: int
+    farmer_name: Optional[str] = None
+    crop: str
+    variety: str
+    quantity: float
+    quantity_unit: str
+    moisture: float
+    min_price: float
+    current_high_bid: float
+    bids_count: int
+    location: str
+    pincode: str
+    coordinates: Optional[Dict[str, float]] = None
+    status: str
+    created_at: datetime
+    expires_at: datetime
+    
+    model_config = ConfigDict(from_attributes=True)
+
+class BidResponse(BaseModel):
+    id: int
+    order_id: int
+    bidder_id: int
+    bidder_name: Optional[str] = None
+    amount: float
+    timestamp: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+class DealResponse(BaseModel):
+    id: int
+    order_id: int
+    seller_id: int
+    seller_name: Optional[str] = None
+    seller_phone: Optional[str] = None
+    buyer_id: int
+    buyer_name: Optional[str] = None
+    buyer_phone: Optional[str] = None
+    
+    crop: Optional[str] = None
+    variety: Optional[str] = None
+    quantity: Optional[float] = None
+    quantity_unit: Optional[str] = None
+    
+    final_price: float
+    total_amount: float
+    status: str
+    transport_mode: Optional[str] = None
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+class NotificationResponse(BaseModel):
+    id: int
+    user_id: int
+    message: str
+    type: str
+    is_read: bool
+    timestamp: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+# ==========================================
+# AUTH & UTILS
+# ==========================================
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+def get_password_hash(password):
+    return pwd_context.hash(password)
+
+def verify_password(plain_password, hashed_password):
+    return pwd_context.verify(plain_password, hashed_password)
+
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security), db: AsyncSession = Depends(get_db)):
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        if user_id is None: raise HTTPException(status_code=401)
+        result = await db.execute(select(User).where(User.id == int(user_id)))
+        user = result.scalar_one_or_none()
+        if not user: raise HTTPException(status_code=401)
+        return user
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+# ==========================================
+# MOCK DATA (Utils)
+# ==========================================
+VARIETIES_DB = {
+    "Dhan (Paddy)": ["Basmati 1121", "Basmati 1509", "PR-14", "Pusa 44", "Sarbati"],
+    "Rice": ["Basmati 1121", "Basmati 1509", "Sona Masoori", "Brown Rice"],
+    "Wheat": ["Sharbati", "Lokwan", "C-306", "PBW-502"],
+    "Mustard": ["Pusa Bold", "Varuna", "Rohini"],
+    "Cotton": ["Bt Cotton", "Desi Cotton"],
+    "Sugarcane": ["Co 0238", "Co 86032"],
+    "Maize": ["Yellow Maize", "Sweet Corn", "Popcorn"],
+    "Pulses (Dal)": ["Moong", "Urad", "Chana", "Arhar/Tur"],
+    "Other": ["Other"]
+}
+
+PRICES_DB = {
+    "Basmati 1121": {"min": 3800, "max": 4200},
+    "Basmati 1509": {"min": 3200, "max": 3500},
+    "PR-14": {"min": 2100, "max": 2300},
+    "Sharbati": {"min": 2800, "max": 3100},
+    "Lokwan": {"min": 2400, "max": 2700},
+    "Pusa Bold": {"min": 5200, "max": 5600},
+    "Bt Cotton": {"min": 6000, "max": 6500},
+    "Moong": {"min": 7000, "max": 7500},
+    "Chana": {"min": 5100, "max": 5400},
+}
+
+PINCODE_DB = {
+    "132001": "Karnal, Haryana",
+    "110001": "New Delhi",
+    "400001": "Mumbai, Maharashtra",
+    "560001": "Bengaluru, Karnataka",
+    "141001": "Ludhiana, Punjab",
+    "243001": "Bareilly, UP",
+    "452001": "Indore, MP",
+    "302001": "Jaipur, Rajasthan",
+}
+
+# ==========================================
+# MAIN APP
+# ==========================================
+app = FastAPI(title="KisanSetu Backend")
+
+# CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def on_startup():
+    await init_db()
+
+# --- AUTH ---
+@app.post("/register", response_model=Token)
+async def register(user_data: dict, db: AsyncSession = Depends(get_db)):
+    # Check existing
+    res = await db.execute(select(User).where(User.phone == user_data['phone']))
+    if res.scalar_one_or_none():
+        raise HTTPException(400, "Phone already registered")
+    
+    user = User(
+        phone=user_data['phone'],
+        password_hash=get_password_hash(user_data['password']),
+        name=user_data['name'],
+        role=user_data['role'],
+        location=user_data['location']
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    
+    token = create_access_token({"sub": str(user.id)})
+    return {"access_token": token, "token_type": "bearer", "user": user}
+
+@app.post("/login", response_model=Token)
+async def login(data: dict, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(User).where(User.phone == data['phone']))
+    user = res.scalar_one_or_none()
+    if not user or not verify_password(data['password'], user.password_hash):
+        raise HTTPException(401, "Invalid credentials")
+    
+    token = create_access_token({"sub": str(user.id)})
+    return {"access_token": token, "token_type": "bearer", "user": user}
+
+@app.get("/users/me", response_model=UserResponse)
+async def get_me(user: User = Depends(get_current_user)):
+    return user
+
+# --- UTILS (Dynamic Data) ---
+@app.get("/utils/varieties")
+async def get_varieties(crop: str):
+    return VARIETIES_DB.get(crop, ["Common", "Hybrid", "Other"])
+
+@app.get("/utils/price")
+async def get_price(crop: str, variety: str):
+    return PRICES_DB.get(variety, {"min": 1800, "max": 2200})
+
+@app.get("/utils/geo/{pincode}")
+async def get_geo(pincode: str):
+    city = PINCODE_DB.get(pincode)
+    if not city:
+        raise HTTPException(404, "Pincode not found in mock DB")
+    return city
+
+@app.get("/utils/transport-rate")
+async def get_transport_rate(dist: float, weight: float):
+    # Base logic: 10rs per km base + 2rs per quintal/km
+    rate = (dist * 10) + (dist * weight * 0.5)
+    return max(rate, 500) # Minimum 500
+
+# --- ORDERS ---
+@app.post("/orders", response_model=OrderResponse)
+async def create_order(data: dict, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    if user.role != "FARMER": raise HTTPException(403, "Only farmers can post")
+    
+    # Check Subscription
+    if user.subscription_expiry < datetime.now(timezone.utc):
+         # Allow 1 crop for free if expired? No, strict check
+         raise HTTPException(403, "Subscription Expired")
+
+    lat = data.get('coordinates', {}).get('lat')
+    lng = data.get('coordinates', {}).get('lng')
+
+    order = Order(
+        farmer_id=user.id,
+        crop=data['crop'],
+        variety=data['variety'],
+        quantity=data['quantity'],
+        quantity_unit=data['quantityUnit'],
+        moisture=data['moisture'],
+        min_price=data['minPrice'],
+        location=data['location'],
+        pincode=data['pincode'],
+        lat=lat,
+        lng=lng,
+        expires_at=datetime.now(timezone.utc) + timedelta(days=7)
+    )
+    db.add(order)
+    await db.commit()
+    await db.refresh(order)
+    order.farmer_name = user.name # Populate for response
+    return order
+
+@app.get("/orders", response_model=List[OrderResponse])
+async def list_orders(db: AsyncSession = Depends(get_db)):
+    # Join User to get farmer name
+    stmt = select(Order, User.name).join(User, Order.farmer_id == User.id).where(Order.status == 'OPEN').order_by(Order.created_at.desc())
+    res = await db.execute(stmt)
+    rows = res.all()
+    
+    orders = []
+    for o, name in rows:
+        o.farmer_name = name
+        orders.append(o)
+    return orders
+
+@app.get("/orders/my", response_model=List[OrderResponse])
+async def my_orders(db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    res = await db.execute(select(Order).where(Order.farmer_id == user.id))
+    return res.scalars().all()
+
+@app.get("/orders/{id}", response_model=OrderResponse)
+async def get_order(id: int, db: AsyncSession = Depends(get_db)):
+    stmt = select(Order, User.name).join(User, Order.farmer_id == User.id).where(Order.id == id)
+    res = await db.execute(stmt)
+    row = res.first()
+    if not row: raise HTTPException(404)
+    o, name = row
+    o.farmer_name = name
+    return o
+
+# --- BIDS ---
+@app.post("/orders/{id}/bids", response_model=BidResponse)
+async def place_bid(id: int, data: dict, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    if user.role == "FARMER": raise HTTPException(403, "Farmers cannot bid")
+    
+    order = await db.get(Order, id)
+    if not order or order.status != "OPEN": raise HTTPException(400, "Order not active")
+    
+    amount = data['amount']
+    if amount <= order.current_high_bid:
+        raise HTTPException(400, "Bid must be higher than current highest")
+
+    bid = Bid(order_id=id, bidder_id=user.id, amount=amount)
+    db.add(bid)
+    
+    # Update Order stats
+    order.current_high_bid = amount
+    order.bids_count += 1
+    
+    # Notify Farmer
+    notif = Notification(user_id=order.farmer_id, message=f"New bid of ₹{amount} on your {order.variety}", type="BID")
+    db.add(notif)
+    
+    await db.commit()
+    await db.refresh(bid)
+    bid.bidder_name = user.name
+    return bid
+
+@app.get("/orders/{id}/bids", response_model=List[BidResponse])
+async def get_bids(id: int, db: AsyncSession = Depends(get_db)):
+    stmt = select(Bid, User.name).join(User, Bid.bidder_id == User.id).where(Bid.order_id == id).order_by(Bid.amount.desc())
+    res = await db.execute(stmt)
+    rows = res.all()
+    bids = []
+    for b, name in rows:
+        b.bidder_name = name
+        bids.append(b)
+    return bids
+
+@app.get("/bids/my", response_model=List[BidResponse])
+async def my_bids(db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    res = await db.execute(select(Bid).where(Bid.bidder_id == user.id))
+    return res.scalars().all()
+
+# --- DEALS & TRANSPORT ---
+@app.post("/orders/{id}/accept-bid", response_model=DealResponse)
+async def accept_bid(id: int, data: dict, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    bid_id = data['bidId']
+    
+    order = await db.get(Order, id)
+    if order.farmer_id != user.id: raise HTTPException(403, "Not your order")
+    
+    bid = await db.get(Bid, bid_id)
+    if not bid: raise HTTPException(404)
+    
+    # Create Deal
+    deal = Deal(
+        order_id=order.id,
+        seller_id=user.id,
+        buyer_id=bid.bidder_id,
+        final_price=bid.amount,
+        total_amount=bid.amount * order.quantity,
+        status="LOCKED"
+    )
+    order.status = "LOCKED"
+    db.add(deal)
+    
+    # Notify Buyer
+    notif = Notification(user_id=bid.bidder_id, message=f"Bid Accepted! Deal created for {order.variety}", type="DEAL")
+    db.add(notif)
+    
+    await db.commit()
+    await db.refresh(deal)
+    
+    # Populate extra fields manually for immediate response
+    deal.seller_name = user.name
+    deal.crop = order.crop
+    deal.variety = order.variety
+    deal.quantity = order.quantity
+    deal.quantity_unit = order.quantity_unit
+    
+    return deal
+
+@app.get("/deals/{id}", response_model=DealResponse)
+async def get_deal(id: int, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    deal = await db.get(Deal, id)
+    if deal.seller_id != user.id and deal.buyer_id != user.id: raise HTTPException(403)
+    
+    # Fetch Related Data
+    order = await db.get(Order, deal.order_id)
+    seller = await db.get(User, deal.seller_id)
+    buyer = await db.get(User, deal.buyer_id)
+    
+    deal.seller_name = seller.name
+    deal.buyer_name = buyer.name
+    deal.crop = order.crop
+    deal.variety = order.variety
+    deal.quantity = order.quantity
+    deal.quantity_unit = order.quantity_unit
+    
+    # PHONE NUMBER PRIVACY LOGIC
+    # Only reveal if status is DIRECT_DEAL or Transport is assigned (implying contact is needed)
+    if deal.status == "DIRECT_DEAL" or deal.transport_mode == "KISAN_SETU":
+        deal.seller_phone = seller.phone
+        deal.buyer_phone = buyer.phone
+    else:
+        deal.seller_phone = None
+        deal.buyer_phone = None
+        
+    return deal
+
+@app.get("/deals", response_model=List[DealResponse])
+async def list_deals(db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    res = await db.execute(select(Deal).where((Deal.seller_id == user.id) | (Deal.buyer_id == user.id)).order_by(Deal.created_at.desc()))
+    deals = res.scalars().all()
+    
+    # We need to populate crop details for the list view
+    enriched_deals = []
+    for d in deals:
+        order = await db.get(Order, d.order_id)
+        # We need buyer/seller names too
+        s = await db.get(User, d.seller_id)
+        b = await db.get(User, d.buyer_id)
+        
+        d.crop = order.crop
+        d.variety = order.variety
+        d.final_price = d.final_price # Already in deal
+        d.seller_name = s.name
+        d.buyer_name = b.name
+        enriched_deals.append(d)
+        
+    return enriched_deals
+
+@app.post("/deals/{id}/finalize")
+async def finalize_deal_mode(id: int, data: dict, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    mode = data['mode'] # KISAN_SETU or DIRECT_DEAL
+    deal = await db.get(Deal, id)
+    
+    if mode == "DIRECT_DEAL":
+        deal.status = "DIRECT_DEAL"
+        deal.transport_mode = "SELF"
+        # Notify both parties with phone numbers
+        n1 = Notification(user_id=deal.seller_id, message=f"Direct Deal Confirmed. Contact buyer.", type="DEAL")
+        n2 = Notification(user_id=deal.buyer_id, message=f"Direct Deal Confirmed. Contact seller.", type="DEAL")
+        db.add(n1)
+        db.add(n2)
+        
+    elif mode == "KISAN_SETU":
+        deal.status = "TRANSIT"
+        deal.transport_mode = "KISAN_SETU"
+        n1 = Notification(user_id=deal.seller_id, message=f"Transport assigned. Vehicle arriving soon.", type="DEAL")
+        db.add(n1)
+        
+    await db.commit()
+    return {"status": "success"}
+
+@app.patch("/deals/{id}/status")
+async def update_deal_status(id: int, data: dict, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    # Simple status update (e.g., mark delivered)
+    deal = await db.get(Deal, id)
+    if deal.seller_id != user.id and deal.buyer_id != user.id: raise HTTPException(403)
+    
+    deal.status = data['status']
+    await db.commit()
+    return {"status": "success"}
+
+# --- KYC & SUBSCRIPTION ---
+@app.post("/kyc/submit")
+async def submit_kyc(data: dict, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    user.kyc_doc_type = data['idType']
+    user.kyc_doc_number = data['idNumber']
+    user.kyc_status = "PENDING"
+    await db.commit()
+    return {"status": "submitted"}
+
+@app.get("/kyc/status")
+async def kyc_status(user: User = Depends(get_current_user)):
+    return {"status": user.kyc_status}
+
+@app.get("/subscription/plans")
+async def get_plans():
+    return [
+        {"id": "FREE", "name": "Free Trial", "price": 0},
+        {"id": "PREMIUM", "name": "Kisan Plus", "price": 499},
+        {"id": "ENTERPRISE", "name": "Trader Pro", "price": 2999}
+    ]
+
+@app.post("/subscription/purchase")
+async def purchase_plan(data: dict, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    plan_id = data['planId']
+    # Mock Payment Logic
+    user.subscription_plan = plan_id
+    user.subscription_expiry = datetime.now(timezone.utc) + timedelta(days=365)
+    await db.commit()
+    return {"status": "active", "expiry": user.subscription_expiry}
+
+# --- ADMIN ---
+@app.get("/admin/users", response_model=List[UserResponse])
+async def admin_get_users(db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    if user.role != "ADMIN": raise HTTPException(403)
+    res = await db.execute(select(User))
+    return res.scalars().all()
+
+@app.post("/admin/users/{id}/verify")
+async def admin_verify(id: int, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    if user.role != "ADMIN": raise HTTPException(403)
+    target_user = await db.get(User, id)
+    target_user.is_verified = True
+    target_user.kyc_status = "APPROVED"
+    target_user.trust_score = 4.5 # Boost score
+    await db.commit()
+    return {"status": "verified"}
+
+# --- NOTIFICATIONS ---
+@app.get("/notifications", response_model=List[NotificationResponse])
+async def get_notifications(db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    res = await db.execute(select(Notification).where(Notification.user_id == user.id).order_by(Notification.timestamp.desc()))
+    return res.scalars().all()
+
+@app.post("/notifications/{id}/read")
+async def mark_read(id: int, db: AsyncSession = Depends(get_db)):
+    n = await db.get(Notification, id)
+    if n:
+        n.is_read = True
+        await db.commit()
+    return {"status": "ok"}

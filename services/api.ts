@@ -1,8 +1,8 @@
 import axios from 'axios';
-import { Order, User, UserRole, OrderStatus, Bid, Deal } from '../types';
+import { Order, User, Bid, Deal, Notification } from '../types';
 
-// Real Backend URL (Cloudflare Tunnel)
-const API_URL = 'https://choice-logging-budapest-flavor.trycloudflare.com';
+// Real Backend URL (Cloudflare Tunnel or Localhost)
+const API_URL = 'https://hybrid-der-evans-buy.trycloudflare.com'; 
 
 // Axios Instance
 export const api = axios.create({
@@ -12,9 +12,6 @@ export const api = axios.create({
   },
 });
 
-// Helper: Convert snake_case to camelCase recursively
-// This ensures frontend code (minPrice) matches backend (min_price)
-// AND converts access_token -> accessToken
 const toCamelCase = (obj: any): any => {
   if (Array.isArray(obj)) {
     return obj.map(v => toCamelCase(v));
@@ -30,22 +27,17 @@ const toCamelCase = (obj: any): any => {
   return obj;
 };
 
-// Response Interceptor: Handle Token & Transform Data
 api.interceptors.response.use(
   (response) => {
     if (response.data) {
-      // Automatically converts access_token to accessToken
       response.data = toCamelCase(response.data);
     }
     return response;
   },
   (error) => {
-    // Handle 401 Unauthorized
     if (error.response?.status === 401) {
-      console.warn("Session expired or unauthorized. Redirecting to login.");
       localStorage.removeItem('token');
       localStorage.removeItem('user');
-      // Redirect to login (using HashRouter format)
       if (!window.location.hash.includes('/auth')) {
           window.location.href = '/#/auth';
       }
@@ -54,7 +46,6 @@ api.interceptors.response.use(
   }
 );
 
-// Request Interceptor: Add Token
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('token');
   if (token) {
@@ -63,183 +54,85 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
+// --- Services ---
+
 export const authService = {
   login: async (phone: string, password: string): Promise<{user: User, token: string}> => {
-    try {
-        // Backend returns { access_token: "...", token_type: "bearer", user: {...} }
-        const response = await api.post('/login', { phone, password });
-        
-        // Data is already converted to camelCase by interceptor
-        // access_token -> accessToken
-        const data = response.data;
-        const token = data.accessToken; 
-        const user = data.user;
-
-        if (!token) throw new Error("No access token received");
-
-        localStorage.setItem('token', token);
-        if (user) {
-            localStorage.setItem('user', JSON.stringify(user));
-        }
-
-        return { user, token };
-    } catch (error) {
-        throw error;
-    }
+    const response = await api.post('/login', { phone, password });
+    const { accessToken, user } = response.data;
+    localStorage.setItem('token', accessToken);
+    localStorage.setItem('user', JSON.stringify(user));
+    return { user, accessToken } as any;
   },
-
-  register: async (userData: { name: string, phone: string, password: string, role: UserRole, location: string }): Promise<{user: User, token: string}> => {
-    try {
-        const response = await api.post('/register', userData);
-        
-        const data = response.data;
-        const token = data.accessToken;
-        const user = data.user;
-
-        if (!token) throw new Error("No access token received");
-
-        localStorage.setItem('token', token);
-        localStorage.setItem('user', JSON.stringify(user));
-        return { user, token };
-    } catch (error) {
-        throw error;
-    }
+  register: async (userData: any): Promise<{user: User, token: string}> => {
+    const response = await api.post('/register', userData);
+    const { accessToken, user } = response.data;
+    localStorage.setItem('token', accessToken);
+    localStorage.setItem('user', JSON.stringify(user));
+    return { user, accessToken } as any;
   },
-
   logout: () => {
     localStorage.removeItem('token');
     localStorage.removeItem('user');
     window.location.href = '/#/auth';
   },
-
   getCurrentUser: (): User | null => {
     const u = localStorage.getItem('user');
     return u ? JSON.parse(u) as User : null;
+  },
+  getMe: async (): Promise<User> => {
+      const response = await api.get('/users/me');
+      const user = response.data;
+      localStorage.setItem('user', JSON.stringify(user));
+      return user;
   }
 };
 
 export const orderService = {
-  getOrders: async (filters?: any): Promise<Order[]> => {
-    try {
-        const response = await api.get('/orders', { params: filters });
-        return response.data || [];
-    } catch (error) {
-        console.warn("API Error (getOrders):", error);
-        return [];
-    }
-  },
-
-  getMyOrders: async (): Promise<Order[]> => {
-    try {
-        const response = await api.get('/orders/my');
-        return response.data || [];
-    } catch (error) {
-        return [];
-    }
-  },
-
-  createOrder: async (orderData: Partial<Order>): Promise<Order> => {
-    try {
-        const response = await api.post('/orders', orderData);
-        return response.data;
-    } catch (error) {
-        throw error;
-    }
-  },
-
-  getOrderById: async (id: string): Promise<Order | undefined> => {
-    try {
-        const response = await api.get(`/orders/${id}`);
-        return response.data;
-    } catch (error) {
-        return undefined;
-    }
-  }
+  getOrders: async (filters?: any) => (await api.get('/orders', { params: filters })).data,
+  getMyOrders: async () => (await api.get('/orders/my')).data, // Ensure backend endpoint matches
+  createOrder: async (data: any) => (await api.post('/orders', data)).data,
+  getOrderById: async (id: string) => (await api.get(`/orders/${id}`)).data,
+  stopBidding: async (id: string) => (await api.post(`/orders/${id}/stop`)).data 
 };
 
 export const bidService = {
-  placeBid: async (orderId: string, amount: number): Promise<Bid> => {
-    try {
-        const response = await api.post(`/orders/${orderId}/bids`, { amount });
-        return response.data;
-    } catch (error) {
-        throw error;
-    }
-  },
-
-  getBidsForOrder: async (orderId: string): Promise<Bid[]> => {
-    try {
-        const response = await api.get(`/orders/${orderId}/bids`);
-        return response.data || [];
-    } catch (error) {
-        return [];
-    }
-  },
-
-  getMyBids: async (): Promise<Bid[]> => {
-    try {
-        const response = await api.get('/bids/my');
-        return response.data || [];
-    } catch (error) {
-        return [];
-    }
-  }
+  placeBid: async (orderId: string, amount: number) => (await api.post(`/orders/${orderId}/bids`, { amount })).data,
+  getBidsForOrder: async (orderId: string) => (await api.get(`/orders/${orderId}/bids`)).data,
+  getMyBids: async () => (await api.get('/bids/my')).data,
 };
 
 export const dealService = {
-    getDeals: async (): Promise<Deal[]> => {
-        try {
-            const response = await api.get('/deals');
-            return response.data || [];
-        } catch (error) {
-            return [];
-        }
-    },
-
-    getDealById: async (id: string): Promise<Deal | undefined> => {
-        try {
-            const response = await api.get(`/deals/${id}`);
-            return response.data;
-        } catch (error) {
-            return undefined;
-        }
-    },
-
-    acceptBid: async (orderId: string, bidId: string): Promise<Deal> => {
-        try {
-            const response = await api.post(`/orders/${orderId}/accept-bid`, { bidId: Number(bidId) });
-            return response.data;
-        } catch (error) {
-            throw error;
-        }
-    },
-
-    updateStatus: async (dealId: string, status: 'LOCKED' | 'IN_TRANSIT' | 'DELIVERED' | 'CANCELLED'): Promise<Deal> => {
-        try {
-            const response = await api.patch(`/deals/${dealId}/status`, { status });
-            return response.data;
-        } catch (error) {
-            throw error;
-        }
-    }
+    getDeals: async () => (await api.get('/deals')).data,
+    getDealById: async (id: string) => (await api.get(`/deals/${id}`)).data,
+    acceptBid: async (orderId: string, bidId: string) => (await api.post(`/orders/${orderId}/accept-bid`, { bidId: Number(bidId) })).data,
+    finalizeDealMode: async (dealId: string, mode: 'KISAN_SETU' | 'DIRECT_DEAL') => (await api.post(`/deals/${dealId}/finalize`, { mode })).data,
+    markDelivered: async (dealId: string) => (await api.patch(`/deals/${dealId}/status`, { status: 'DELIVERED' })).data
 };
 
 export const adminService = {
-    getUsers: async (): Promise<User[]> => {
-        try {
-            const response = await api.get('/admin/users');
-            return response.data || [];
-        } catch (error) {
-            return [];
-        }
-    },
+    getUsers: async () => (await api.get('/admin/users')).data,
+    verifyUser: async (userId: string) => (await api.post(`/admin/users/${userId}/verify`)).data
+};
 
-    verifyUser: async (userId: string): Promise<User> => {
-        try {
-            const response = await api.post(`/admin/users/${userId}/verify`);
-            return response.data;
-        } catch (error) {
-            throw error;
-        }
-    }
+export const utilService = {
+    getVarieties: async (crop: string) => (await api.get(`/utils/varieties?crop=${crop}`)).data,
+    getMarketPrice: async (crop: string, variety: string) => (await api.get(`/utils/price?crop=${crop}&variety=${variety}`)).data,
+    getLocationByPincode: async (pincode: string) => (await api.get(`/utils/geo/${pincode}`)).data,
+    getTransportRate: async (distance: number, weight: number) => (await api.get(`/utils/transport-rate?dist=${distance}&weight=${weight}`)).data
+};
+
+export const kycService = {
+    submitKYC: async (idType: string, idNumber: string) => (await api.post('/kyc/submit', { idType, idNumber })).data,
+    getStatus: async () => (await api.get('/kyc/status')).data
+};
+
+export const subscriptionService = {
+    getPlans: async () => (await api.get('/subscription/plans')).data,
+    purchasePlan: async (planId: string) => (await api.post('/subscription/purchase', { planId })).data
+};
+
+export const notificationService = {
+    getAll: async () => (await api.get('/notifications')).data,
+    markRead: async (id: string) => (await api.post(`/notifications/${id}/read`)).data
 };

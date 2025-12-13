@@ -37,16 +37,15 @@
       }
     </script>
     <style>
-      /* Fallback font stack if Inter isn't loaded via Google Fonts */
       body { font-family: 'Inter', system-ui, -apple-system, sans-serif; }
+      .no-scrollbar::-webkit-scrollbar { display: none; }
+      .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
       
-      /* Hide scrollbar for clean UI */
-      .no-scrollbar::-webkit-scrollbar {
-          display: none;
-      }
-      .no-scrollbar {
-          -ms-overflow-style: none;
-          scrollbar-width: none;
+      @media print {
+        header, .md\:hidden, button { display: none !important; }
+        body { background: white; }
+        .shadow-lg { box-shadow: none !important; border: 1px solid #ddd; }
+        .text-3xl { font-size: 24px; }
       }
     </style>
   <script type="importmap">
