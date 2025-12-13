@@ -1,7 +1,7 @@
 import axios from 'axios';
 import { Order, User, UserRole, OrderStatus, Bid, Deal } from '../types';
 
-// Real Backend URL
+// Real Backend URL (Cloudflare Tunnel)
 const API_URL = 'https://choice-logging-budapest-flavor.trycloudflare.com';
 
 // Axios Instance
@@ -12,7 +12,49 @@ export const api = axios.create({
   },
 });
 
-// JWT Interceptor
+// Helper: Convert snake_case to camelCase recursively
+// This ensures frontend code (minPrice) matches backend (min_price)
+// AND converts access_token -> accessToken
+const toCamelCase = (obj: any): any => {
+  if (Array.isArray(obj)) {
+    return obj.map(v => toCamelCase(v));
+  } else if (obj !== null && obj.constructor === Object) {
+    return Object.keys(obj).reduce(
+      (result, key) => ({
+        ...result,
+        [key.replace(/_([a-z])/g, (g) => g[1].toUpperCase())]: toCamelCase(obj[key]),
+      }),
+      {},
+    );
+  }
+  return obj;
+};
+
+// Response Interceptor: Handle Token & Transform Data
+api.interceptors.response.use(
+  (response) => {
+    if (response.data) {
+      // Automatically converts access_token to accessToken
+      response.data = toCamelCase(response.data);
+    }
+    return response;
+  },
+  (error) => {
+    // Handle 401 Unauthorized
+    if (error.response?.status === 401) {
+      console.warn("Session expired or unauthorized. Redirecting to login.");
+      localStorage.removeItem('token');
+      localStorage.removeItem('user');
+      // Redirect to login (using HashRouter format)
+      if (!window.location.hash.includes('/auth')) {
+          window.location.href = '/#/auth';
+      }
+    }
+    return Promise.reject(error);
+  }
+);
+
+// Request Interceptor: Add Token
 api.interceptors.request.use((config) => {
   const token = localStorage.getItem('token');
   if (token) {
@@ -21,26 +63,25 @@ api.interceptors.request.use((config) => {
   return config;
 });
 
-// Global Error Handler Helper
-const handleApiError = (error: any) => {
-    if (error.response) {
-        console.error("API Error:", error.response.data);
-        throw new Error(error.response.data.message || "Server Error");
-    } else if (error.request) {
-        console.error("Network Error");
-        throw new Error("Network Error - Check your connection");
-    } else {
-        throw new Error(error.message);
-    }
-};
-
 export const authService = {
   login: async (phone: string, password: string): Promise<{user: User, token: string}> => {
     try {
+        // Backend returns { access_token: "...", token_type: "bearer", user: {...} }
         const response = await api.post('/login', { phone, password });
-        const { user, token } = response.data;
+        
+        // Data is already converted to camelCase by interceptor
+        // access_token -> accessToken
+        const data = response.data;
+        const token = data.accessToken; 
+        const user = data.user;
+
+        if (!token) throw new Error("No access token received");
+
         localStorage.setItem('token', token);
-        localStorage.setItem('user', JSON.stringify(user));
+        if (user) {
+            localStorage.setItem('user', JSON.stringify(user));
+        }
+
         return { user, token };
     } catch (error) {
         throw error;
@@ -50,7 +91,13 @@ export const authService = {
   register: async (userData: { name: string, phone: string, password: string, role: UserRole, location: string }): Promise<{user: User, token: string}> => {
     try {
         const response = await api.post('/register', userData);
-        const { user, token } = response.data;
+        
+        const data = response.data;
+        const token = data.accessToken;
+        const user = data.user;
+
+        if (!token) throw new Error("No access token received");
+
         localStorage.setItem('token', token);
         localStorage.setItem('user', JSON.stringify(user));
         return { user, token };
@@ -62,6 +109,7 @@ export const authService = {
   logout: () => {
     localStorage.removeItem('token');
     localStorage.removeItem('user');
+    window.location.href = '/#/auth';
   },
 
   getCurrentUser: (): User | null => {
@@ -73,11 +121,10 @@ export const authService = {
 export const orderService = {
   getOrders: async (filters?: any): Promise<Order[]> => {
     try {
-        // Backend should handle filtering via query params
         const response = await api.get('/orders', { params: filters });
         return response.data || [];
     } catch (error) {
-        console.warn("Failed to fetch orders, returning empty list", error);
+        console.warn("API Error (getOrders):", error);
         return [];
     }
   },
@@ -160,7 +207,7 @@ export const dealService = {
 
     acceptBid: async (orderId: string, bidId: string): Promise<Deal> => {
         try {
-            const response = await api.post(`/orders/${orderId}/accept-bid`, { bidId });
+            const response = await api.post(`/orders/${orderId}/accept-bid`, { bidId: Number(bidId) });
             return response.data;
         } catch (error) {
             throw error;
