@@ -2,7 +2,7 @@ import axios from 'axios';
 import { Order, User, Bid, Deal, Notification } from '../types';
 
 // Real Backend URL (Cloudflare Tunnel or Localhost)
-const API_URL = 'https://brilliant-xhtml-dom-bull.trycloudflare.com0'; 
+const API_URL = 'https://brilliant-xhtml-dom-bull.trycloudflare.com'; 
 
 // Axios Instance
 export const api = axios.create({
