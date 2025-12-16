@@ -3,6 +3,7 @@ import { Link, useLocation, useNavigate } from 'react-router-dom';
 import { Menu, X, Home, ShoppingBag, PlusCircle, User, LogOut, Bell, Shield, Crown } from 'lucide-react';
 import { authService, notificationService } from '../services/api';
 import { useQuery } from '@tanstack/react-query';
+import { UserRole } from '../types';
 
 export const Layout: React.FC<{ children?: React.ReactNode }> = ({ children }) => {
   const [isMenuOpen, setIsMenuOpen] = useState(false);
@@ -71,7 +72,11 @@ export const Layout: React.FC<{ children?: React.ReactNode }> = ({ children }) =
             {/* Desktop Nav */}
             <div className="hidden md:flex items-center space-x-6">
               <Link to="/browse" className={`font-medium ${isActive('/browse') ? 'text-agri-600' : 'text-gray-600'}`}>Marketplace</Link>
-              <Link to="/post-order" className={`font-medium ${isActive('/post-order') ? 'text-agri-600' : 'text-gray-600'}`}>Sell Crop</Link>
+              
+              {/* Only Farmers see Sell Crop */}
+              {user?.role === UserRole.FARMER && (
+                <Link to="/post-order" className={`font-medium ${isActive('/post-order') ? 'text-agri-600' : 'text-gray-600'}`}>Sell Crop</Link>
+              )}
               
               {user?.role === 'ADMIN' && (
                   <Link to="/admin" className="text-red-600 font-medium flex items-center"><Shield className="w-4 h-4 mr-1"/> Admin</Link>
@@ -178,7 +183,7 @@ export const Layout: React.FC<{ children?: React.ReactNode }> = ({ children }) =
            <div className="absolute right-0 top-0 bottom-0 w-72 bg-white shadow-2xl pt-20 px-4 flex flex-col space-y-2" onClick={e => e.stopPropagation()}>
               <NavItem to="/dashboard" icon={Home} label="Dashboard" />
               <NavItem to="/browse" icon={ShoppingBag} label="Browse Mandi" />
-              <NavItem to="/post-order" icon={PlusCircle} label="Sell Crop" />
+              {user?.role === UserRole.FARMER && <NavItem to="/post-order" icon={PlusCircle} label="Sell Crop" />}
               <NavItem to="/profile" icon={User} label="Profile & KYC" />
               <NavItem to="/subscription" icon={Crown} label="Plans" />
               {user?.role === 'ADMIN' && <NavItem to="/admin" icon={Shield} label="Admin Panel" />}
@@ -206,12 +211,17 @@ export const Layout: React.FC<{ children?: React.ReactNode }> = ({ children }) =
           <ShoppingBag className="w-6 h-6" />
           <span className="text-[10px]">Mandi</span>
         </Link>
-        <Link to="/post-order" className="flex flex-col items-center -mt-8">
-           <div className="bg-agri-600 text-white p-4 rounded-full shadow-lg ring-4 ring-gray-50">
-             <PlusCircle className="w-6 h-6" />
-           </div>
-           <span className="text-[10px] text-agri-700">Sell</span>
-        </Link>
+        
+        {/* Only show center Sell button if Farmer */}
+        {user?.role === UserRole.FARMER && (
+            <Link to="/post-order" className="flex flex-col items-center -mt-8">
+            <div className="bg-agri-600 text-white p-4 rounded-full shadow-lg ring-4 ring-gray-50">
+                <PlusCircle className="w-6 h-6" />
+            </div>
+            <span className="text-[10px] text-agri-700">Sell</span>
+            </Link>
+        )}
+
         <Link to="/profile" className={`flex flex-col items-center p-2 rounded-lg ${isActive('/profile') ? 'text-agri-600' : 'text-gray-400'}`}>
           <User className="w-6 h-6" />
           <span className="text-[10px]">Profile</span>

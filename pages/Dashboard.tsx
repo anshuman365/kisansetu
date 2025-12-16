@@ -117,7 +117,7 @@ export const Dashboard: React.FC = () => {
               <h2 className="text-lg font-bold text-gray-800 mb-3">Recent Deals</h2>
               <div className="space-y-3">
                   {myDeals.map((deal: any) => (
-                      <Card key={deal.id} className="p-4 border-l-4 border-l-green-500" onClick={() => navigate(`/deals/${deal.id}`)}>
+                      <Card key={deal.id} className="p-4 border-l-4 border-l-green-500 cursor-pointer" onClick={() => navigate(`/deals/${deal.id}`)}>
                           <div className="flex justify-between items-center">
                                <div>
                                    <p className="font-bold text-gray-900">{deal.variety}</p>

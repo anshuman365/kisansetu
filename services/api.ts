@@ -2,7 +2,7 @@ import axios from 'axios';
 import { Order, User, Bid, Deal, Notification } from '../types';
 
 // Real Backend URL (Cloudflare Tunnel or Localhost)
-const API_URL = 'https://brilliant-xhtml-dom-bull.trycloudflare.com'; 
+const API_URL = 'http://127.0.0.1:8000'; 
 
 // Axios Instance
 export const api = axios.create({
@@ -119,7 +119,8 @@ export const utilService = {
     getVarieties: async (crop: string) => (await api.get(`/utils/varieties?crop=${crop}`)).data,
     getMarketPrice: async (crop: string, variety: string) => (await api.get(`/utils/price?crop=${crop}&variety=${variety}`)).data,
     getLocationByPincode: async (pincode: string) => (await api.get(`/utils/geo/${pincode}`)).data,
-    getTransportRate: async (distance: number, weight: number) => (await api.get(`/utils/transport-rate?dist=${distance}&weight=${weight}`)).data
+    getTransportRate: async (distance: number, weight: number) => (await api.get(`/utils/transport-rate?dist=${distance}&weight=${weight}`)).data,
+    reverseGeocode: async (lat: number, lng: number) => (await api.get(`/utils/reverse-geocode?lat=${lat}&lng=${lng}`)).data
 };
 
 export const kycService = {
