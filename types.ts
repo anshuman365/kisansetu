@@ -33,6 +33,13 @@ export interface Subscription {
   isActive: boolean;
 }
 
+export interface BankDetails {
+  accountNumber: string;
+  bankName: string;
+  branchName: string;
+  ifscCode: string;
+}
+
 export interface User {
   id: string;
   name: string;
@@ -40,7 +47,15 @@ export interface User {
   role: UserRole;
   location: string;
   isVerified: boolean;
+  isBlocked: boolean; // New field
   kycStatus: 'PENDING' | 'APPROVED' | 'REJECTED' | 'NOT_SUBMITTED';
+  kycData?: {
+    idType: string;
+    idNumber: string;
+    idImageUrl?: string;
+    livePhotoUrl?: string;
+  };
+  bankDetails?: BankDetails;
   trustScore: number;
   subscription: Subscription;
 }
@@ -91,6 +106,7 @@ export interface Deal {
   totalAmount: number;
   status: OrderStatus;
   transportMode?: 'KISAN_SETU' | 'SELF';
+  paymentStatus: 'PENDING' | 'PAID' | 'FAILED';
   createdAt: string;
 }
 

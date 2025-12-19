@@ -1,0 +1,559 @@
+from fastapi import FastAPI, Depends, HTTPException, status, Query, Body, Request
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine, async_sessionmaker
+from sqlalchemy.orm import declarative_base, selectinload
+from sqlalchemy import Column, Integer, String, Float, DateTime, Boolean, ForeignKey, select, update, func
+from passlib.context import CryptContext
+from jose import JWTError, jwt
+from datetime import datetime, timedelta, timezone
+from typing import Optional, List, Dict, Any
+import enum
+import os
+import random
+import httpx # For external geocoding calls if needed
+from pydantic import BaseModel, Field, ConfigDict
+
+# ==========================================
+# CONFIGURATION
+# ==========================================
+SECRET_KEY = "kisan-setu-secure-secret-key-change-this"
+ALGORITHM = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 30 # 30 Days
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./kisansetu.db")
+
+engine = create_async_engine(DATABASE_URL, echo=False)
+Base = declarative_base()
+AsyncSessionLocal = async_sessionmaker(engine, expire_on_commit=False)
+
+async def get_db():
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+            await session.commit()
+        except Exception:
+            await session.rollback()
+            raise
+        finally:
+            await session.close()
+
+async def init_db():
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+# ==========================================
+# MODELS
+# ==========================================
+
+class User(Base):
+    __tablename__ = "users"
+    id = Column(Integer, primary_key=True, index=True)
+    phone = Column(String, unique=True, index=True, nullable=False)
+    password_hash = Column(String, nullable=False)
+    name = Column(String, nullable=False)
+    role = Column(String, nullable=False) # FARMER, BUYER, ADMIN
+    location = Column(String, nullable=False)
+    
+    is_verified = Column(Boolean, default=False)
+    kyc_status = Column(String, default="NOT_SUBMITTED") 
+    kyc_doc_type = Column(String, nullable=True)
+    kyc_doc_number = Column(String, nullable=True)
+    trust_score = Column(Float, default=3.5)
+    
+    subscription_plan = Column(String, default="FREE") 
+    subscription_expiry = Column(DateTime(timezone=True), default=lambda: datetime.now(timezone.utc) + timedelta(days=15))
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    @property
+    def subscription(self):
+        return {
+            "plan": self.subscription_plan,
+            "expiry_date": self.subscription_expiry,
+            "is_active": self.subscription_expiry > datetime.now(timezone.utc)
+        }
+
+class Order(Base):
+    __tablename__ = "orders"
+    id = Column(Integer, primary_key=True, index=True)
+    farmer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    crop = Column(String, nullable=False)
+    variety = Column(String, nullable=False)
+    quantity = Column(Float, nullable=False)
+    quantity_unit = Column(String, nullable=False)
+    moisture = Column(Float, nullable=True)
+    min_price = Column(Float, nullable=False)
+    location = Column(String, nullable=False)
+    pincode = Column(String, nullable=False)
+    lat = Column(Float, nullable=True)
+    lng = Column(Float, nullable=True)
+    status = Column(String, default="OPEN")
+    current_high_bid = Column(Float, default=0)
+    bids_count = Column(Integer, default=0)
+    expires_at = Column(DateTime(timezone=True), nullable=False)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    @property
+    def coordinates(self):
+        return {"lat": self.lat, "lng": self.lng} if self.lat and self.lng else None
+
+class Bid(Base):
+    __tablename__ = "bids"
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("orders.id"), nullable=False)
+    bidder_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    amount = Column(Float, nullable=False)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+
+class Deal(Base):
+    __tablename__ = "deals"
+    id = Column(Integer, primary_key=True, index=True)
+    order_id = Column(Integer, ForeignKey("orders.id"), nullable=False)
+    seller_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    buyer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    final_price = Column(Float, nullable=False)
+    total_amount = Column(Float, nullable=False)
+    
+    # Fulfillment
+    status = Column(String, default="LOCKED") 
+    transport_mode = Column(String, nullable=True)
+    
+    # Payment & Tracking (New)
+    payment_status = Column(String, default="PENDING") # PENDING, ESCROW_HELD, RELEASED
+    tracking_status = Column(String, default="PENDING") # PENDING, VEHICLE_ASSIGNED, IN_TRANSIT, DELIVERED
+    tracking_id = Column(String, nullable=True)
+    
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class Review(Base):
+    __tablename__ = "reviews"
+    id = Column(Integer, primary_key=True, index=True)
+    deal_id = Column(Integer, ForeignKey("deals.id"), nullable=False)
+    reviewer_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    reviewee_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    rating = Column(Integer, nullable=False) # 1-5
+    comment = Column(String, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+class Notification(Base):
+    __tablename__ = "notifications"
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False)
+    message = Column(String, nullable=False)
+    type = Column(String, default="SYSTEM") 
+    is_read = Column(Boolean, default=False)
+    timestamp = Column(DateTime(timezone=True), server_default=func.now())
+
+# ==========================================
+# PYDANTIC SCHEMAS
+# ==========================================
+
+class SubscriptionObj(BaseModel):
+    plan: str
+    expiry_date: datetime
+    is_active: bool
+
+class UserResponse(BaseModel):
+    id: int
+    name: str
+    phone: str
+    role: str
+    location: str
+    is_verified: bool
+    kyc_status: str
+    trust_score: float
+    subscription: SubscriptionObj
+    model_config = ConfigDict(from_attributes=True)
+
+class Token(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: UserResponse
+
+class OrderResponse(BaseModel):
+    id: int
+    farmer_id: int
+    farmer_name: Optional[str] = None
+    crop: str
+    variety: str
+    quantity: float
+    quantity_unit: str
+    moisture: float
+    min_price: float
+    current_high_bid: float
+    bids_count: int
+    location: str
+    pincode: str
+    coordinates: Optional[Dict[str, float]] = None
+    status: str
+    created_at: datetime
+    expires_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+class BidResponse(BaseModel):
+    id: int
+    order_id: int
+    bidder_id: int
+    bidder_name: Optional[str] = None
+    amount: float
+    timestamp: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+class DealResponse(BaseModel):
+    id: int
+    order_id: int
+    seller_id: int
+    seller_name: Optional[str] = None
+    seller_phone: Optional[str] = None
+    buyer_id: int
+    buyer_name: Optional[str] = None
+    buyer_phone: Optional[str] = None
+    crop: Optional[str] = None
+    variety: Optional[str] = None
+    quantity: Optional[float] = None
+    quantity_unit: Optional[str] = None
+    final_price: float
+    total_amount: float
+    status: str
+    transport_mode: Optional[str] = None
+    payment_status: str
+    tracking_status: str
+    tracking_id: Optional[str] = None
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+class NotificationResponse(BaseModel):
+    id: int
+    user_id: int
+    message: str
+    type: str
+    is_read: bool
+    timestamp: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+# ==========================================
+# AUTH & UTILS
+# ==========================================
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+security = HTTPBearer()
+
+def get_password_hash(password): return pwd_context.hash(password)
+def verify_password(plain, hashed): return pwd_context.verify(plain, hashed)
+def create_access_token(data: dict):
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    to_encode.update({"exp": expire})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+async def get_current_user(creds: HTTPAuthorizationCredentials = Depends(security), db: AsyncSession = Depends(get_db)):
+    try:
+        payload = jwt.decode(creds.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id = payload.get("sub")
+        if user_id is None: raise HTTPException(401)
+        res = await db.execute(select(User).where(User.id == int(user_id)))
+        user = res.scalar_one_or_none()
+        if not user: raise HTTPException(401)
+        return user
+    except JWTError: raise HTTPException(401)
+
+async def create_notif(db: AsyncSession, user_id: int, msg: str, type: str = "SYSTEM"):
+    db.add(Notification(user_id=user_id, message=msg, type=type))
+
+# ==========================================
+# MAIN APP
+# ==========================================
+app = FastAPI(title="KisanSetu Backend")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+@app.on_event("startup")
+async def on_startup(): await init_db()
+
+# --- AUTH ---
+@app.post("/register", response_model=Token)
+async def register(user_data: dict, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(User).where(User.phone == user_data['phone']))
+    if res.scalar_one_or_none(): raise HTTPException(400, "Phone taken")
+    user = User(
+        phone=user_data['phone'],
+        password_hash=get_password_hash(user_data['password']),
+        name=user_data['name'],
+        role=user_data['role'],
+        location=user_data['location']
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    token = create_access_token({"sub": str(user.id)})
+    return {"access_token": token, "token_type": "bearer", "user": user}
+
+@app.post("/login", response_model=Token)
+async def login(data: dict, db: AsyncSession = Depends(get_db)):
+    res = await db.execute(select(User).where(User.phone == data['phone']))
+    user = res.scalar_one_or_none()
+    if not user or not verify_password(data['password'], user.password_hash):
+        raise HTTPException(401, "Invalid credentials")
+    token = create_access_token({"sub": str(user.id)})
+    return {"access_token": token, "token_type": "bearer", "user": user}
+
+@app.get("/users/me", response_model=UserResponse)
+async def get_me(user: User = Depends(get_current_user)): return user
+
+# --- ORDERS ---
+@app.post("/orders", response_model=OrderResponse)
+async def create_order(data: dict, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    if user.role != "FARMER": raise HTTPException(403, "Farmers only")
+    if user.subscription_expiry < datetime.now(timezone.utc): raise HTTPException(403, "Subscription Expired")
+    
+    order = Order(
+        farmer_id=user.id,
+        crop=data['crop'],
+        variety=data['variety'],
+        quantity=data['quantity'],
+        quantity_unit=data['quantityUnit'],
+        moisture=data.get('moisture'),
+        min_price=data['minPrice'],
+        location=data['location'],
+        pincode=data['pincode'],
+        lat=data.get('coordinates', {}).get('lat'),
+        lng=data.get('coordinates', {}).get('lng'),
+        expires_at=datetime.now(timezone.utc) + timedelta(days=7)
+    )
+    db.add(order)
+    await db.commit()
+    await db.refresh(order)
+    await create_notif(db, user.id, f"Order created for {order.variety}", "SYSTEM")
+    await db.commit()
+    order.farmer_name = user.name
+    return order
+
+@app.get("/orders", response_model=List[OrderResponse])
+async def list_orders(db: AsyncSession = Depends(get_db)):
+    stmt = select(Order, User.name).join(User, Order.farmer_id == User.id).where(Order.status == 'OPEN').order_by(Order.created_at.desc())
+    res = await db.execute(stmt)
+    rows = res.all()
+    return [{**o.__dict__, "farmer_name": name, "coordinates": o.coordinates} for o, name in rows]
+
+@app.get("/orders/my", response_model=List[OrderResponse])
+async def my_orders(db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    res = await db.execute(select(Order).where(Order.farmer_id == user.id))
+    return res.scalars().all()
+
+@app.get("/orders/{id}", response_model=OrderResponse)
+async def get_order(id: int, db: AsyncSession = Depends(get_db)):
+    stmt = select(Order, User.name).join(User, Order.farmer_id == User.id).where(Order.id == id)
+    res = await db.execute(stmt)
+    row = res.first()
+    if not row: raise HTTPException(404)
+    o, name = row
+    o.farmer_name = name
+    return o
+
+@app.post("/orders/{id}/stop")
+async def stop_order(id: int, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    o = await db.get(Order, id)
+    if o.farmer_id != user.id: raise HTTPException(403)
+    o.status = "CANCELLED"
+    await db.commit()
+    return {"status": "ok"}
+
+# --- BIDS ---
+@app.post("/orders/{id}/bids", response_model=BidResponse)
+async def place_bid(id: int, data: dict, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    if user.role == "FARMER": raise HTTPException(403)
+    o = await db.get(Order, id)
+    if not o or o.status != "OPEN": raise HTTPException(400)
+    
+    bid = Bid(order_id=id, bidder_id=user.id, amount=data['amount'])
+    db.add(bid)
+    o.current_high_bid = data['amount']
+    o.bids_count += 1
+    await create_notif(db, o.farmer_id, f"New bid: ₹{bid.amount} for {o.variety}", "BID")
+    await db.commit()
+    await db.refresh(bid)
+    bid.bidder_name = user.name
+    return bid
+
+@app.get("/orders/{id}/bids", response_model=List[BidResponse])
+async def get_bids(id: int, db: AsyncSession = Depends(get_db)):
+    stmt = select(Bid, User.name).join(User, Bid.bidder_id == User.id).where(Bid.order_id == id).order_by(Bid.amount.desc())
+    res = await db.execute(stmt)
+    return [{**b.__dict__, "bidder_name": name} for b, name in res.all()]
+
+@app.get("/bids/my", response_model=List[BidResponse])
+async def my_bids(db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    res = await db.execute(select(Bid).where(Bid.bidder_id == user.id))
+    return res.scalars().all()
+
+# --- DEALS ---
+@app.post("/orders/{id}/accept-bid", response_model=DealResponse)
+async def accept_bid(id: int, data: dict, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    o = await db.get(Order, id)
+    if o.farmer_id != user.id: raise HTTPException(403)
+    bid = await db.get(Bid, data['bidId'])
+    
+    deal = Deal(
+        order_id=o.id, seller_id=user.id, buyer_id=bid.bidder_id,
+        final_price=bid.amount, total_amount=bid.amount * o.quantity,
+        status="LOCKED"
+    )
+    o.status = "LOCKED"
+    db.add(deal)
+    await create_notif(db, bid.bidder_id, f"Bid Accepted for {o.variety}!", "DEAL")
+    await db.commit()
+    await db.refresh(deal)
+    # Populate extra for response
+    deal.seller_name = user.name
+    deal.crop, deal.variety, deal.quantity, deal.quantity_unit = o.crop, o.variety, o.quantity, o.quantity_unit
+    return deal
+
+@app.get("/deals/{id}", response_model=DealResponse)
+async def get_deal(id: int, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    deal = await db.get(Deal, id)
+    if not deal: raise HTTPException(404)
+    if user.id not in [deal.seller_id, deal.buyer_id]: raise HTTPException(403)
+    
+    o = await db.get(Order, deal.order_id)
+    s = await db.get(User, deal.seller_id)
+    b = await db.get(User, deal.buyer_id)
+    
+    deal.seller_name, deal.buyer_name = s.name, b.name
+    deal.crop, deal.variety, deal.quantity, deal.quantity_unit = o.crop, o.variety, o.quantity, o.quantity_unit
+    
+    if deal.status == "DIRECT_DEAL" or deal.transport_mode == "KISAN_SETU":
+        deal.seller_phone, deal.buyer_phone = s.phone, b.phone
+    
+    return deal
+
+@app.get("/deals", response_model=List[DealResponse])
+async def list_deals(db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    res = await db.execute(select(Deal).where((Deal.seller_id == user.id) | (Deal.buyer_id == user.id)).order_by(Deal.created_at.desc()))
+    deals = res.scalars().all()
+    out = []
+    for d in deals:
+        o = await db.get(Order, d.order_id)
+        s = await db.get(User, d.seller_id)
+        b = await db.get(User, d.buyer_id)
+        d.seller_name, d.buyer_name = s.name, b.name
+        d.crop, d.variety, d.quantity, d.quantity_unit = o.crop, o.variety, o.quantity, o.quantity_unit
+        out.append(d)
+    return out
+
+@app.post("/deals/{id}/finalize")
+async def finalize_deal(id: int, data: dict, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    deal = await db.get(Deal, id)
+    mode = data['mode']
+    if mode == "DIRECT_DEAL":
+        deal.status, deal.transport_mode = "DIRECT_DEAL", "SELF"
+        await create_notif(db, deal.seller_id, "Direct Deal Confirmed", "DEAL")
+        await create_notif(db, deal.buyer_id, "Direct Deal Confirmed", "DEAL")
+    elif mode == "KISAN_SETU":
+        deal.status, deal.transport_mode = "TRANSIT", "KISAN_SETU"
+        deal.tracking_status, deal.tracking_id = "VEHICLE_ASSIGNED", f"TRK-{random.randint(1000,9999)}"
+        await create_notif(db, deal.seller_id, "Logistics Assigned", "DEAL")
+    await db.commit()
+    return {"status": "ok"}
+
+@app.post("/deals/{id}/pay")
+async def pay_deal(id: int, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    deal = await db.get(Deal, id)
+    if deal.buyer_id != user.id: raise HTTPException(403)
+    deal.payment_status = "ESCROW_HELD"
+    await create_notif(db, deal.seller_id, f"Payment of ₹{deal.total_amount} held in Escrow", "DEAL")
+    await db.commit()
+    return {"status": "paid"}
+
+@app.post("/deals/{id}/track")
+async def track_deal(id: int, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    deal = await db.get(Deal, id)
+    # Simulate tracking update
+    deal.tracking_status = "IN_TRANSIT"
+    await db.commit()
+    return {"status": deal.tracking_status}
+
+@app.post("/deals/{id}/review")
+async def review_deal(id: int, data: dict, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    deal = await db.get(Deal, id)
+    target_id = deal.seller_id if user.id == deal.buyer_id else deal.buyer_id
+    
+    rev = Review(deal_id=id, reviewer_id=user.id, reviewee_id=target_id, rating=data['rating'], comment=data['comment'])
+    db.add(rev)
+    
+    # Recalc Trust Score
+    stmt = select(func.avg(Review.rating)).where(Review.reviewee_id == target_id)
+    avg = (await db.execute(stmt)).scalar()
+    target_user = await db.get(User, target_id)
+    target_user.trust_score = round(avg, 1) if avg else 3.5
+    
+    await db.commit()
+    return {"status": "reviewed"}
+
+# --- UTILS ---
+@app.get("/utils/reverse-geocode")
+async def reverse_geocode(lat: float, lng: float):
+    # Use a robust mock logic to return varied results based on coordinates
+    # In production, uncomment the httpx block and use API key
+    
+    # MOCK LOGIC:
+    if lat > 28:
+        return {"city": "Karnal", "district": "Karnal", "state": "Haryana", "pincode": "132001"}
+    elif lat > 20:
+        return {"city": "Indore", "district": "Indore", "state": "Madhya Pradesh", "pincode": "452001"}
+    else:
+        return {"city": "Bengaluru", "district": "Bengaluru", "state": "Karnataka", "pincode": "560001"}
+
+@app.get("/utils/varieties")
+async def get_varieties(crop: str):
+    db = {"Dhan (Paddy)": ["Basmati 1121", "PR-14"], "Wheat": ["Sharbati", "Lokwan"]}
+    return db.get(crop, ["Common", "Hybrid"])
+
+@app.get("/utils/price")
+async def get_price(crop: str, variety: str):
+    return {"min": 2000, "max": 2500}
+
+@app.get("/utils/geo/{pincode}")
+async def get_geo(pincode: str):
+    return "Sample City"
+
+# --- SUBSCRIPTION & KYC ---
+@app.post("/subscription/purchase")
+async def purchase_sub(data: dict, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    user.subscription_plan = data['planId']
+    user.subscription_expiry = datetime.now(timezone.utc) + timedelta(days=365)
+    await db.commit()
+    return {"status": "ok"}
+
+@app.post("/kyc/submit")
+async def kyc_submit(data: dict, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    user.kyc_status, user.kyc_doc_type, user.kyc_doc_number = "PENDING", data['idType'], data['idNumber']
+    await db.commit()
+    return {"status": "ok"}
+
+@app.get("/kyc/status")
+async def kyc_status(user: User = Depends(get_current_user)): return {"status": user.kyc_status}
+
+# --- ADMIN ---
+@app.post("/admin/notifications/push")
+async def admin_push(data: dict, db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    if user.role != "ADMIN": raise HTTPException(403)
+    # Broadcast to all users (simplified)
+    users = (await db.execute(select(User))).scalars().all()
+    for u in users:
+        await create_notif(db, u.id, data['message'], "SYSTEM")
+    await db.commit()
+    return {"status": "sent"}
+
+@app.get("/notifications", response_model=List[NotificationResponse])
+async def get_notifs(db: AsyncSession = Depends(get_db), user: User = Depends(get_current_user)):
+    res = await db.execute(select(Notification).where(Notification.user_id == user.id).order_by(Notification.timestamp.desc()))
+    return res.scalars().all()
+
+@app.post("/notifications/{id}/read")
+async def read_notif(id: int, db: AsyncSession = Depends(get_db)):
+    n = await db.get(Notification, id)
+    if n: n.is_read = True; await db.commit()
+    return {"status": "ok"}

@@ -1,10 +1,88 @@
-# BACKEND STATUS: UP TO DATE
 
-The backend code in `kisan_setu_backend/app/main.txt` has been fully updated to support all V2 features:
-1. Geocoding (Mocked/Ready for API)
-2. Reviews & Trust Score
-3. Deal Payments & Tracking
-4. Admin Push Notifications
-5. Subscription Management
+# KISAN SETU BACKEND REFACTOR SPECIFICATION v2.0
 
-No further suggestions pending.
+## 1. Modular Directory Structure
+The current `main.py` is too large. Refactor into the following structure:
+
+```
+app/
+├── main.py              # App entry point, CORS config, exception handlers
+├── config.py            # Envs (DATABASE_URL, SECRET_KEY, RAZORPAY_KEY)
+├── dependencies.py      # get_db, get_current_user, role_checker
+├── models/              # SQLAlchemy Models
+│   ├── user.py
+│   ├── order.py
+│   ├── deal.py          # Includes Payment & Review models
+│   └── common.py        # Base class
+├── schemas/             # Pydantic Schemas (Request/Response)
+│   ├── auth_schema.py
+│   ├── order_schema.py
+│   └── deal_schema.py
+├── routers/             # API Route Handlers
+│   ├── auth.py          # Login, Register, Me
+│   ├── orders.py        # CRUD for Orders & Bids
+│   ├── deals.py         # Deal Logic, Payments, Reviews
+│   ├── admin.py         # User verification, Blocking, Stats
+│   └── utils.py         # Geocoding, Price API
+└── services/            # Business Logic / External Integrations
+    ├── payment.py       # Razorpay Integration logic
+    ├── geocoding.py     # Google Maps / OpenStreetMaps logic
+    └── notifications.py # Notification creation logic
+```
+
+## 2. Advanced Feature Logic
+
+### A. Phone Number Privacy Logic
+In `routers/deals.py`, the `get_deal` endpoint must apply strict logic before returning phone numbers.
+*   **Logic:**
+    ```python
+    if current_user.id in [deal.buyer_id, deal.seller_id]:
+        if deal.status == 'DIRECT_DEAL':
+            return phone_numbers
+        elif deal.transport_mode == 'KISAN_SETU' and deal.payment_status == 'PAID':
+            return phone_numbers
+    return masked_numbers # e.g. "+91 98XXX XXXXX"
+    ```
+
+### B. Payment Gateway (Razorpay/Stripe) Integration
+In `routers/deals.py`:
+1.  `POST /deals/{id}/pay/initiate`:
+    *   Call Razorpay API to create an order.
+    *   Save `razorpay_order_id` in `Deal` table.
+    *   Return order_id to frontend.
+2.  `POST /deals/{id}/pay/verify`:
+    *   Receive `razorpay_payment_id`, `razorpay_signature`.
+    *   Verify signature using SDK.
+    *   If valid: Update `Deal.payment_status = 'PAID'`, `Deal.status = 'TRANSIT'`.
+    *   Trigger Notification to Seller.
+
+### C. Geocoding Service (`services/geocoding.py`)
+1.  **Coordinates -> Pincode (Reverse):**
+    *   Use `httpx` to call OpenStreetMap Nominatim API (Free) or Google Geocoding API (Paid/Reliable).
+    *   Extract `postcode` and `city` from JSON response.
+2.  **Pincode -> Location:**
+    *   Keep a cached database/JSON of Indian Pincodes to avoid API rate limits.
+
+### D. User Blocking & KYC
+In `routers/admin.py`:
+*   `POST /users/{id}/block`: Toggle `is_blocked` in DB.
+*   **Middleware:** Create a dependency `check_user_active` that runs before every protected route. If `user.is_blocked` is True, raise `403 Forbidden`.
+
+### E. File Uploads (KYC)
+*   Use `python-multipart` for handling `UploadFile`.
+*   Store files in an AWS S3 bucket (preferred) or a local `/static/uploads` folder.
+*   Save the file URL in `User.kyc_data`.
+
+## 3. Database Updates
+Run the following migrations (or ensure tables are created):
+1.  **Users Table:**
+    *   Add `is_blocked` (Boolean, default False).
+    *   Add `bank_details` (JSON or separate table).
+    *   Add `kyc_docs` (JSON - stores URLs of uploaded images).
+2.  **Deals Table:**
+    *   Add `razorpay_order_id`, `payment_id` (Strings).
+    *   Add `review_id` (ForeignKey to Reviews).
+
+## 4. Performance
+*   Use `selectinload` for relationships (Orders -> User) to avoid N+1 query problems.
+*   Implement Redis caching for `utils/price` endpoints as market rates don't change every second.

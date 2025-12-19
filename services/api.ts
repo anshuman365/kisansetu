@@ -1,8 +1,9 @@
+
 import axios from 'axios';
 import { Order, User, Bid, Deal, Notification } from '../types';
 
 // Real Backend URL (Cloudflare Tunnel or Localhost)
-const API_URL = 'https://brilliant-xhtml-dom-bull.trycloudflare.com'; 
+const API_URL = 'http://127.0.0.1:8000'; 
 
 // Axios Instance
 export const api = axios.create({
@@ -107,12 +108,18 @@ export const dealService = {
     getDealById: async (id: string) => (await api.get(`/deals/${id}`)).data,
     acceptBid: async (orderId: string, bidId: string) => (await api.post(`/orders/${orderId}/accept-bid`, { bidId: Number(bidId) })).data,
     finalizeDealMode: async (dealId: string, mode: 'KISAN_SETU' | 'DIRECT_DEAL') => (await api.post(`/deals/${dealId}/finalize`, { mode })).data,
-    markDelivered: async (dealId: string) => (await api.patch(`/deals/${dealId}/status`, { status: 'DELIVERED' })).data
+    initiatePayment: async (dealId: string, amount: number) => (await api.post(`/deals/${dealId}/pay/initiate`, { amount })).data,
+    verifyPayment: async (dealId: string, paymentData: any) => (await api.post(`/deals/${dealId}/pay/verify`, paymentData)).data,
+    markDelivered: async (dealId: string) => (await api.patch(`/deals/${dealId}/status`, { status: 'DELIVERED' })).data,
+    submitReview: async (dealId: string, rating: number, comment: string) => (await api.post(`/deals/${dealId}/review`, { rating, comment })).data
 };
 
 export const adminService = {
     getUsers: async () => (await api.get('/admin/users')).data,
-    verifyUser: async (userId: string) => (await api.post(`/admin/users/${userId}/verify`)).data
+    verifyUser: async (userId: string, status: 'APPROVED' | 'REJECTED') => (await api.post(`/admin/users/${userId}/verify`, { status })).data,
+    blockUser: async (userId: string, isBlocked: boolean) => (await api.post(`/admin/users/${userId}/block`, { isBlocked })).data,
+    getAllTransactions: async () => (await api.get('/admin/transactions')).data,
+    getAllBids: async () => (await api.get('/admin/bids')).data
 };
 
 export const utilService = {
@@ -124,7 +131,11 @@ export const utilService = {
 };
 
 export const kycService = {
-    submitKYC: async (idType: string, idNumber: string) => (await api.post('/kyc/submit', { idType, idNumber })).data,
+    submitKYC: async (formData: FormData) => {
+        return (await api.post('/kyc/submit', formData, {
+            headers: { 'Content-Type': 'multipart/form-data' }
+        })).data;
+    },
     getStatus: async () => (await api.get('/kyc/status')).data
 };
 

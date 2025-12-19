@@ -1,0 +1,11 @@
+fastapi
+uvicorn
+sqlalchemy
+aiosqlite
+pydantic
+python-jose[cryptography]
+passlib[bcrypt]
+python-multipart
+httpx
+razorpay
+requests
